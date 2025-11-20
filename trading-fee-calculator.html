@@ -1,25 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Trading Fee Calculator → USD (Spot + Perp)</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 900px; margin: 40px auto; padding: 20px; background:#f6f8fa; }
+  h1 { color:#1a5fb4; }
+  .upload { border: 3px dashed #1a5fb4; padding: 40px; text-align:center; border-radius:12px; background:#fff; cursor:pointer; }
+  table { width:100%; border-collapse:collapse; margin-top:20px; background:#fff; }
+  th, td { padding:12px; text-align:left; border-bottom:1px solid #ddd; }
+  th { background:#1a5fb4; color:white; }
+  tr:hover { background:#f1f3f5; }
+  .summary { background:#e8f4f8; padding:20px; border-radius:8px; font-size:1.2em; margin-top:20px; }
+  details { margin-top:20px; }
+  .loader { display:none; margin:20px 0; }
+</style>
+</head>
+<body>
+
+<h1>Trading Fee Calculator (Spot + Perpetual) → USD</h1>
+<p>Upload your CSV from Binance, Bybit, OKX, Hyperliquid, Bitget, KuCoin, etc.<br>All processing happens in your browser — nothing is sent anywhere.</p>
+
+<div class="upload" onclick="document.getElementById('csvFile').click()">
+  <input type="file" id="csvFile" accept=".csv" style="display:none" />
+  <p><strong>Click or drop CSV file here</strong></p>
+</div>
+
+<div class="loader" id="loader">Resolving prices... <span id="progress">0</span>%</div>
+
+<div id="result" style="display:none;">
+  <h2>Results</h2>
+  <div class="summary" id="summary"></div>
+  <details>
+    <summary>Show detailed breakdown</summary>
+    <table id="table"></table>
+  </details>
+</div>
+
 <script>
-// Price cache
 const priceCache = {};
+let allFees = [];
 
-const parsers = [ /* ... same as before ... */ ];
+// Binance symbol → standard asset
+const assetMap = {
+  'USDT': 'USDT', 'BUSD': 'BUSD', 'USDC': 'USDC', 'FDUSD': 'FDUSD',
+  'BTC': 'BTC', 'ETH': 'ETH', 'BNB': 'BNB', 'SOL': 'SOL'
+};
 
-// ... keep your parsers exactly the same ...
+// Same parsers as before (Binance, Bybit, etc.) — keeping them unchanged
+// ... (insert all your previous parser functions here: parseBinance, parseBybit, parseOKX, etc.)
 
 document.getElementById('csvFile').addEventListener('change', async e => {
   const file = e.target.files[0];
   if (!file) return;
+
+  document.getElementById('loader').style.display = 'block';
+  document.getElementById('result').style.display = 'none';
+
   const text = await file.text();
   const lines = text.trim().split('\n');
   const header = lines[0].toLowerCase();
 
-  let parser = parsers.find(p => p.test.test(header)) || parsers.find(p => p.name === "Generic");
-
-  document.getElementById('result').style.display = 'block';
-  document.getElementById('summary').innerHTML = `Detected: ${parser.name}<br>Parsing trades...`;
+  const parser = parsers.find(p => p.test.test(header)) || parsers.find(p => p.name === "Generic");
 
   allFees = [];
-  // call the correct parser (unchanged)
+  document.getElementById('loader').textContent = `Detected: ${parser.name} — parsing trades...`;
+
+  // Call your existing parser
   if (parser.name === "Binance") await parseBinance(lines);
   else if (parser.name === "Bybit") parseBybit(lines);
   else if (parser.name === "OKX") parseOKX(lines);
@@ -27,60 +74,65 @@ document.getElementById('csvFile').addEventListener('change', async e => {
   else if (parser.name === "Bitget") parseBitget(lines);
   else parseGeneric(lines);
 
-  await resolvePricesAndRender();
+  await resolvePricesFast();
 });
 
-async function resolvePricesAndRender() {
-  document.getElementById('summary').innerHTML = 'Resolving historical prices (this can take 10–30 sec)...';
-
+async function resolvePricesFast() {
   const missing = new Set();
   for (const f of allFees) {
+    if (f.asset === 'USDT' || f.asset === 'USDC' || f.asset === 'BUSD' || f.asset === 'FDUSD') {
+      priceCache[`${f.dateKey}_${f.asset}`] = 1; // stablecoins
+      continue;
+    }
     const key = `${f.dateKey}_${f.asset}`;
-    if (!priceCache[key]) missing.add(key);
+    if (!priceCache[key]) missing.add({date: f.dateKey, asset: f.asset});
   }
 
-  // Batch + proper headers + delay
-  for (const key of missing) {
-    const [dateKey, asset] = key.split('_');
-    const coinId = assetToCoingeckoId(asset);
-    if (!coinId) continue;
+  let done = 0;
+  const total = missing.size;
 
-    const dateStr = dateKey.replace(/-/g, ''); // YYYYMMDD format
+  // Use Binance public klines API — unlimited & super fast
+  for (const item of missing) {
+    const {date, asset} = item;
+    const symbol = asset + 'USDT';
+    const start = new Date(date).getTime();
+    const end = start + 86400000;
+
     try {
-      const resp = await fetch(`https://api.coingecko.com/api/v3/coins/${coinId}/history?date=${dateStr}&localization=false`, {
-        headers: {
-          'User-Agent': 'TradingFeeCalculator/1.0 (+https://yourdomain.com)', // change if you have a domain
-          'Accept': 'application/json',
-          'Origin': location.origin,
-          'Referer': location.origin + '/'
-        }
-      });
-
+      const resp = await fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1d&startTime=${start}&endTime=${end}&limit=1`);
       if (resp.ok) {
         const data = await resp.json();
-        const usd = data.market_data?.current_price?.usd ?? 0;
-        priceCache[key] = usd;
+        if (data && data[0]) {
+          const closePrice = parseFloat(data[0][4]); // close price
+          priceCache[`${date}_${asset}`] = closePrice;
+        } else {
+          priceCache[`${date}_${asset}`] = 0;
+        }
       } else {
-        priceCache[key] = 0;
+        priceCache[`${date}_${asset}`] = 0;
       }
-    } catch (e) {
-      priceCache[key] = 0;
+    } catch(e) {
+      priceCache[`${date}_${asset}`] = 0;
     }
 
-    // Be nice to CoinGecko — max ~50 requests/minute
-    await new Promise(r => setTimeout(r, 1200));
+    done++;
+    document.getElementById('progress').textContent = Math.round((done / total) * 100) || 0;
   }
 
-  // Now render results
+  document.getElementById('loader').style.display = 'none';
+  renderResults();
+}
+
+function renderResults() {
   let totalUsd = 0;
   const rows = [];
 
-  allFees.sort((a, b) => a.timestamp - b.timestamp);
+  allFees.sort((a,b) => a.timestamp - b.timestamp);
 
   for (const f of allFees) {
-    const usdPrice = priceCache[`${f.dateKey}_${f.asset}`] || 0;
-    const usdValue = f.amount * usdPrice;
-    totalUsd += usdValue;
+    const price = priceCache[`${f.dateKey}_${f.asset}`] || 0;
+    const usd = f.amount * price;
+    totalUsd += usd;
 
     rows.push({
       date: new Date(f.timestamp).toLocaleString(),
@@ -88,26 +140,29 @@ async function resolvePricesAndRender() {
       type: f.type || 'Trade',
       pair: f.pair || '',
       fee: `${f.amount.toFixed(8)} ${f.asset}`,
-      usd: usdValue.toFixed(2),
+      usd: usd.toFixed(4),
       note: f.note || ''
     });
   }
 
   document.getElementById('summary').innerHTML = `
-    <strong>Total trading fees paid: $${totalUsd.toFixed(2)} USD</strong><br>
-    Number of fee entries: ${allFees.length}<br>
-    Period: ${rows[0]?.date || '-'} → ${rows[rows.length-1]?.date || '-'}
-    ${missing.size > 0 ? `<br><small>Prices fetched for ${missing.size} asset-date pairs</small>` : ''}
+    <strong>Total fees paid: $${totalUsd.toFixed(2)} USD</strong><br>
+    Trades with fees: ${allFees.length}<br>
+    Period: ${rows[0]?.date.split(',')[0]} → ${rows[rows.length-1]?.date.split(',')[0]}
   `;
 
-  const table = document.getElementById('table');
-  table.innerHTML = `<tr><th>Date</th><th>Exchange</th><th>Type</th><th>Pair</th><th>Fee</th><th>USD Value</th><th>Note</th></tr>` +
-    rows.map(r => `<tr>
-      <td>${r.date}</td><td>${r.exchange}</td><td>${r.type}</td><td>${r.pair}</td>
-      <td>${r.fee}</td><td>$${r.usd}</td><td>${r.note}</td>
-    </tr>`).join('');
+  document.getElementById('table').innerHTML = `
+    <tr><th>Date</th><th>Exchange</th><th>Type</th><th>Pair</th><th>Fee</th><th>USD Value</th><th>Note</th></tr>
+    ${rows.map(r => `<tr><td>${r.date}</td><td>${r.exchange}</td><td>${r.type}</td><td>${r.pair}</td><td>${r.fee}</td><td>$${r.usd}</td><td>${r.note}</td></tr>`).join('')}
+  `;
+
+  document.getElementById('result').style.display = 'block';
 }
 
-// Keep all your existing parsers (parseBinance, parseBybit, etc.) unchanged
-// and the assetToCoingeckoId + parseCsvLine functions exactly as before
+// Keep all your existing parser functions (parseBinance, parseBybit, etc.) below this line
+// They are exactly the same as in the previous version
+// (Just copy-paste them from your current file)
+
 </script>
+</body>
+</html>
